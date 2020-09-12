@@ -12,3 +12,4 @@ src-git freifunk https://github.com/freifunk/openwrt-packages.git
 src-git kenzo https://github.com/kenzok8/openwrt-package
 src-git mypackages https://github.com/siropboy/mypackages
 src-git clone https://github.com/destan19/OpenAppFilter
+src-git small https://github.com/kenzok8/small
