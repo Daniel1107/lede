@@ -8,12 +8,18 @@
 name: OpenWrt-CI
 
 on:
-#  schedule:
-#    - cron: 0 20 * * *
-   watch:
-     types: [started]
+  repository_dispatch:
   release:
-    types: [published]
+    types: published
+  push:
+    branches:
+      - main
+    paths:
+      - '.config'
+#  schedule:
+#    - cron: 0 8 * * 5
+#  watch:
+#    types: started
 
 jobs:
 
