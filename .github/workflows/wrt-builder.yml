@@ -1,0 +1,237 @@
+# =============================================================================
+# WRT-Builder v3.1 —— 旁挂主编译 workflow（fork 仓根目录 .github/workflows/）
+# 骨架来源：coolsnowwolf/lede 官方 openwrt-ci.yml（其 apt 表与流程每天被上游 CI 验证，
+#           2026-10-28~11-02 连续 6 次 success 实查存档见 .research/）
+# 吸收件：lgs2007m(dispatch inputs 面板 + ssh2actions)、kiddin9(cachewrtbuild)、
+#         gd0772(action 钉版本)、用户 260329 版(保留 swap/坏包清理/GIT_TERMINAL_PROMPT)
+# =============================================================================
+name: WRT-Builder v3.1
+
+on:
+  workflow_dispatch:
+    inputs:
+      config_file:
+        description: '.config 种子路径'
+        required: true
+        default: 'wrt/generic-x86-64.config'
+      lan_ip:
+        description: '路由器 LAN IP（注入 uci-defaults）'
+        required: false
+        default: '10.10.10.22'
+      theme:
+        description: '默认 LuCI 主题（缺失自动跳过）'
+        required: false
+        default: 'argon'
+      ssh:
+        description: 'true = 编译前挂起并开放 SSH（在线 menuconfig/排错）'
+        required: false
+        default: 'false'
+      nocache:
+        description: 'true = 弃用构建缓存全新编译（缓存中毒时用）'
+        required: false
+        default: 'false'
+      upload_release:
+        description: 'true = 固件同时发布到 Releases'
+        required: false
+        default: 'false'
+      extra_packages:
+        description: '额外烘入插件（空格分隔包名，种子之上追加；缓存热时出件快）'
+        required: false
+        default: ''
+  repository_dispatch:
+    types: [wrt-build]
+  push:
+    paths:
+      - 'wrt/**'
+      - 'files/**'
+    branches: [master]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wrt-builder
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04          # 22.04 于 2027-04-17 下线（runner-images #14254）
+    timeout-minutes: 360
+    env:
+      TZ: Asia/Shanghai
+    steps:
+      - name: Generate timestamp
+        run: echo "FILE_DATE=$(date +%Y%m%d_%H%M)" >> $GITHUB_ENV
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Init environment（lean 官方 apt 表，全部包已在 noble 验证存在）
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E rm -rf /usr/share/dotnet /etc/mysql /etc/php /usr/local/lib/android
+          # ubuntu-24.04 的 apt 源在 sources.list.d/ubuntu.sources(deb822)，整目录删除会清空所有仓库(22.04 老配方之毒)
+          sudo -E rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/azure* 2>/dev/null || true
+          sudo -E apt-mark hold grub-efi-amd64-signed || true
+          sudo -E apt update
+          sudo -E apt -y purge azure-cli* docker* ghc* zulu* llvm* firefox google* dotnet* powershell* openjdk* mysql* php* mongodb* dotnet* snap* || true
+          sudo -E apt -y full-upgrade
+          sudo -E apt -y install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib gettext genisoimage git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz msmtp ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+          sudo -E systemctl daemon-reload
+          sudo -E apt -y autoremove --purge
+          sudo -E apt clean
+          sudo -E timedatectl set-timezone "$TZ"
+
+      - name: Free disk space（保留 swap 防 OOM-kill —— 260329 实战教训）
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Update feeds（追加 small 源 + 3 次重试）
+        run: |
+          export GIT_TERMINAL_PROMPT=0
+          grep -q "^src-git small" feeds.conf.default || echo "src-git small https://github.com/kenzok8/small" >> feeds.conf.default
+          for i in 1 2 3; do ./scripts/feeds update -a && break || { echo "feeds update retry $i"; sleep 15; }; done
+
+      - name: DIY plugins（3月插件清单 + 到位核对表写入 Summary）
+        run: |
+          chmod +x wrt/diy-plugins.sh
+          ./wrt/diy-plugins.sh
+
+      - name: Install feeds（3 次重试）
+        run: |
+          export GIT_TERMINAL_PROMPT=0
+          for i in 1 2 3; do ./scripts/feeds install -a && break || { echo "feeds install retry $i"; sleep 15; }; done
+
+      - name: Load config & inject uci-defaults
+        run: |
+          CFG="${{ inputs.config_file || github.event.client_payload.config_file || 'wrt/generic-x86-64.config' }}"
+          echo "使用种子: $CFG"
+          cp "$CFG" .config
+          sed -i "s|__LAN_IP__|${{ inputs.lan_ip || '10.10.10.22' }}|g" files/etc/uci-defaults/99-custom.sh
+          sed -i "s|__THEME__|${{ inputs.theme || 'argon' }}|g" files/etc/uci-defaults/99-custom.sh
+          sed -i "s|__ROOT_PASS__|${{ secrets.ROOT_PASSWD || 'wyh' }}|g" files/etc/uci-defaults/99-custom.sh
+          chmod -R 755 files
+          rm -rf tmp/
+          for p in ${{ inputs.extra_packages }}; do ./scripts/config -e "CONFIG_PACKAGE_$p"; done
+          make defconfig
+          grep -E "^CONFIG_(TARGET_x86|VMDK|GRUB_EFI|TARGET_IMAGES_GZIP)" .config || true
+
+      - name: Build cache（kiddin9 同款 cachewrtbuild：staging_dir+toolchain+ccache）
+        uses: stupidloud/cachewrtbuild@main
+        with:
+          ccache: 'true'
+          toolchain: 'true'
+          mixkey: x86-64-efi
+          clean: ${{ github.event.inputs.nocache == 'true' }}
+          skip: 'false'
+          prefix: ${{ github.workspace }}
+
+      - name: Re-apply config（防 cachewrtbuild 清理 .config 的保险丝）
+        run: |
+          CFG="${{ inputs.config_file || github.event.client_payload.config_file || 'wrt/generic-x86-64.config' }}"
+          [ -f .config ] || cp "$CFG" .config
+          for p in ${{ inputs.extra_packages }}; do ./scripts/config -e "CONFIG_PACKAGE_$p"; done
+          make defconfig
+
+      - name: SSH debug（VPS 反向隧道面板，零公共中继依赖）
+        if: github.event.inputs.ssh == 'true'
+        env:
+          PANEL_PEM: ${{ secrets.SSH_PANEL_PEM }}
+          PANEL_HOST: cloud.105588.xyz
+          PANEL_USER: root
+          PANEL_RPORT: '22222'
+          RUNNER_SSHD_PORT: '2200'
+        run: |
+          set +e
+          push(){ curl -s -m 15 -X POST -H "X-Title: $1" -d "$2" https://ntfy.sh/wrtpanel-jnkl7sdc || true; }
+          [ -n "$PANEL_PEM" ] || { push "PANEL skip" "SSH_PANEL_PEM 缺失，直通编译"; exit 0; }
+          push "panel-init" "装 sshd、搭 VPS 反向隧道中"
+          sudo -E apt-get update -qq >/dev/null 2>&1
+          sudo -E apt-get install -y -qq openssh-server >/dev/null 2>&1 || { push "PANEL FAIL" "sshd 安装失败，直通编译"; exit 0; }
+          sudo mkdir -p /run/sshd /root/.ssh && sudo chmod 700 /root/.ssh
+          sudo ssh-keygen -A
+          cat .github/panel_pubkey | sudo tee -a /root/.ssh/authorized_keys >/dev/null
+          sudo chmod 600 /root/.ssh/authorized_keys
+          printf 'Port %s\nListenAddress 127.0.0.1\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nPubkeyAuthentication yes\nUsePAM no\nPidFile /run/sshd_panel.pid\nHostKey /etc/ssh/ssh_host_rsa_key\nHostKey /etc/ssh/ssh_host_ed25519_key\n' "$RUNNER_SSHD_PORT" | sudo tee /tmp/sshd_panel.conf >/dev/null
+          sudo /usr/sbin/sshd -f /tmp/sshd_panel.conf || { push "PANEL FAIL" "runner sshd 启动失败，直通编译"; exit 0; }
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$PANEL_PEM" > ~/.ssh/panel.pem && chmod 600 ~/.ssh/panel.pem
+          ssh-keyscan -p 22 "$PANEL_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          printf 'Host panelvps\n  HostName %s\n  User %s\n  Port 22\n  IdentityFile ~/.ssh/panel.pem\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n' "$PANEL_HOST" "$PANEL_USER" >> ~/.ssh/config
+          ( while :; do ssh -n -N -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -R "${PANEL_RPORT}:127.0.0.1:${RUNNER_SSHD_PORT}" panelvps; sleep 5; done ) &
+          TUN=$!
+          L=0
+          for i in 1 2 3 4 5 6; do
+            sleep 5
+            L=$(ssh panelvps "ss -tln | grep -c '127.0.0.1:${PANEL_RPORT}'" 2>/dev/null)
+            L=$(echo "$L" | tr -dc 0-9); L=${L:-0}
+            [ "$L" -ge 1 ] && break
+          done
+          if [ "$L" -lt 1 ]; then push "PANEL FAIL" "隧道未在 VPS 建立 22222 监听，直通编译"; exit 0; fi
+          push "panel ready (menuconfig)" "连接命令: ssh -i ~/.ssh/dmit_vps.pem -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -J root@${PANEL_HOST} -p ${PANEL_RPORT} root@127.0.0.1   |  进去后: cd /home/runner/work/lede/lede && make menuconfig   |  <Save>后退出自动续编译"
+          echo "::notice::panel ready via ${PANEL_HOST}:${PANEL_RPORT}"
+          while :; do
+            sleep 10
+            EST=$(sudo ss -tn 2>/dev/null | grep ":${RUNNER_SSHD_PORT}" | grep -c ESTAB || true)
+            [ "${EST:-0}" -ge 1 ] && break
+          done
+          push "panel attached" "你已连上，退出面板后自动续编译"
+          while :; do
+            sleep 60
+            EST=$(sudo ss -tn 2>/dev/null | grep ":${RUNNER_SSHD_PORT}" | grep -c ESTAB || true)
+            [ "${EST:-0}" -eq 0 ] && break
+          done
+          push "panel closed" "继续编译"
+          kill $TUN 2>/dev/null
+          sudo kill "$(cat /run/sshd_panel.pid 2>/dev/null)" 2>/dev/null
+          sudo chown -R "$(id -un)" "$GITHUB_WORKSPACE" 2>/dev/null
+          exit 0
+
+      - name: Download packages（坏包清理双轮 —— 260329 实战件）
+        run: |
+          make download -j8 || true
+          find dl -size -1024c -exec rm -f {} \;
+          make download -j8 || true
+
+      - name: Compile（j1 V=s 兜底出可读报错）
+        run: make -j$(nproc) || make -j1 V=s
+
+      - name: Upload .config（menuconfig 手配结果留档，用于回写种子）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotconfig-${{ env.FILE_DATE }}
+          path: .config
+          if-no-files-found: ignore
+
+      - name: 产物清单写入 Summary
+        if: always()
+        run: |
+          {
+            echo "### bin/targets 产物"
+            find bin/targets -type f \( -name '*.bin' -o -name '*.img*' -o -name '*.vmdk*' -o -name '*.manifest' \) -printf '%p  %s bytes\n' 2>/dev/null | sort || echo "(无产物)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-x86-64-${{ env.FILE_DATE }}
+          path: bin/targets/
+          retention-days: 30
+
+      - name: Release（可选，面板勾选）
+        if: github.event.inputs.upload_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fw-${{ env.FILE_DATE }}
+          files: |
+            bin/targets/**/*combined-efi.vmdk
+            bin/targets/**/*.img.gz
