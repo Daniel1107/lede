@@ -1,0 +1,60 @@
+# =============================================================================
+# WRT-Nightly v3.1 —— pin 式自动追上游（吸收 Kikoch 思想 + P3TERX dispatch 链路）
+# 逻辑：比对上游 HEAD 与 fork HEAD → 无变化直接结束（0 分钟）→
+#       有变化调 GitHub merge-upstream API 同步 fork（fork 自身 commit 即 pin，可复现）→
+#       repository_dispatch 触发 WRT-Builder（GITHUB_TOKEN 触发 dispatch 为 P3TERX 已验证链路）
+# =============================================================================
+name: WRT-Nightly
+
+on:
+  schedule:
+    - cron: '0 20 * * *'   # 每日 20:00 UTC（错开上游 CI 的 20:00 触发点，它跑完数据更新我们跟编）
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  sync-and-trigger:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Compare upstream HEAD vs fork HEAD
+        id: cmp
+        run: |
+          UP=$(git ls-remote https://github.com/coolsnowwolf/lede.git HEAD | cut -f1)
+          FORK=$(git ls-remote https://github.com/${{ github.repository }}.git HEAD | cut -f1)
+          echo "upstream=$UP"
+          echo "fork=$FORK"
+          if [ "$UP" = "$FORK" ]; then
+            echo "无新提交，跳过（省时区分钟数）" >> "$GITHUB_STEP_SUMMARY"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "上游有更新：$FORK -> $UP" >> "$GITHUB_STEP_SUMMARY"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream into fork（merge-upstream API，非强制）
+        if: steps.cmp.outputs.changed == 'true'
+        run: |
+          CODE=$(curl -s -o merge.json -w "%{http_code}" -X PUT \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/merge-upstream" \
+            -d '{"branch":"master"}')
+          echo "HTTP $CODE"; cat merge.json 2>/dev/null || true
+          case "$CODE" in
+            200|204) echo "同步成功（fork 新 commit 即本次固件的可复现版本点）" ;;
+            *) echo "同步失败（可能是冲突），本次不触发编译。人工处理见计划书 §5"; exit 1 ;;
+          esac
+
+      - name: Trigger WRT-Builder
+        if: steps.cmp.outputs.changed == 'true'
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+            -d '{"event_type":"wrt-build","client_payload":{"config_file":"wrt/generic-x86-64.config"}}'
+          echo "已触发 WRT-Builder（repository_dispatch: wrt-build）"
