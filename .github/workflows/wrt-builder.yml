@@ -210,7 +210,8 @@ jobs:
         with:
           name: dotconfig-${{ env.FILE_DATE }}
           path: .config
-          if-no-files-found: ignore
+          if-no-files-found: error
+          include-hidden-files: true
 
       - name: 产物清单写入 Summary
         if: always()
