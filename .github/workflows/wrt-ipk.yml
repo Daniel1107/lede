@@ -1,0 +1,144 @@
+# =============================================================================
+# WRT-IPK v1.0 —— IPK 单件编译：只编你要更新的插件，缓存命中时 5~20 分钟出件
+# 吸收件：linkease/openwrt-app-actions（dispatch 填插件名 → 单编 → ipk 产物）
+#         OpenWrt-K（同树编译保真，不借道 SDK —— lean 无官方 SDK）
+# 缓存：与 builder 同 mixkey(x86-64-efi) 的 cachewrtbuild，restore_keys 跨工作流互捞
+# 用法：面板填包名(空格分隔) → 下载 ipk-日期 压缩包 → scp 到路由器 opkg install
+# 注意：ipk 与固件内核/库版本必须匹配 —— 请保证本工作流的源码 commit ≤ 在用固件的构建 commit
+# =============================================================================
+name: WRT-IPK v1.0
+
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: '包名（空格分隔），需在 feeds 内存在'
+        required: true
+        default: 'luci-app-arpbind'
+      nocache:
+        description: 'true = 弃用构建缓存（缓存中毒时用）'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wrt-ipk
+  cancel-in-progress: false
+
+jobs:
+  ipk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      TZ: Asia/Shanghai
+    steps:
+      - name: Generate timestamp
+        run: echo "FILE_DATE=$(date +%Y%m%d_%H%M)" >> $GITHUB_ENV
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Init environment（与 builder 同配方）
+        run: |
+          sudo -E rm -rf /usr/share/dotnet /etc/mysql /etc/php /usr/local/lib/android
+          sudo -E rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/azure* 2>/dev/null || true
+          sudo -E apt update
+          sudo -E apt -y full-upgrade
+          sudo -E apt -y install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib gettext genisoimage git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz msmtp ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+          sudo -E apt clean
+          sudo -E timedatectl set-timezone "$TZ"
+
+      - name: Free disk space（保留 swap 防 OOM）
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Update feeds（与 builder 同配方）
+        run: |
+          export GIT_TERMINAL_PROMPT=0
+          grep -q "^src-git small" feeds.conf.default || echo "src-git small https://github.com/kenzok8/small" >> feeds.conf.default
+          for i in 1 2 3; do ./scripts/feeds update -a && break || { echo "feeds update retry $i"; sleep 15; }; done
+
+      - name: DIY plugins（与 builder 同源，保证插件可解析）
+        run: |
+          chmod +x wrt/diy-plugins.sh
+          ./wrt/diy-plugins.sh
+
+      - name: Install feeds（3 次重试）
+        run: |
+          export GIT_TERMINAL_PROMPT=0
+          for i in 1 2 3; do ./scripts/feeds install -a && break || { echo "feeds install retry $i"; sleep 15; }; done
+
+      - name: Load config seed
+        run: |
+          cp wrt/generic-x86-64.config .config
+          make defconfig
+
+      - name: Build cache（同 mixkey 捞 builder 的缓存）
+        uses: stupidloud/cachewrtbuild@main
+        with:
+          ccache: 'true'
+          toolchain: 'true'
+          mixkey: x86-64-efi
+          clean: ${{ github.event.inputs.nocache == 'true' }}
+          skip: 'false'
+          prefix: ${{ github.workspace }}
+
+      - name: Re-apply config（保险丝）
+        run: |
+          [ -f .config ] || cp wrt/generic-x86-64.config .config
+          make defconfig
+
+      - name: Resolve packages（定位 feed 路径 + 选中符号 + 依赖）
+        run: |
+          : > /tmp/targets
+          MISSING=""
+          for p in ${{ inputs.packages }}; do
+            d=$(find -L package -maxdepth 4 -type d -name "$p" 2>/dev/null | head -1)
+            if [ -z "$d" ]; then MISSING="$MISSING $p"; continue; fi
+            ./scripts/config -e "CONFIG_PACKAGE_$p" || true
+            echo -n "$d/clean $d/compile " >> /tmp/targets
+            echo "resolved: $p -> $d"
+          done
+          if [ ! -s /tmp/targets ]; then
+            echo "### 无一可解析" >> "$GITHUB_STEP_SUMMARY"
+            echo "未找到:${MISSING}（确认拼写，如 arpbind 无连字符；或先加 feeds）" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          [ -n "$MISSING" ] && echo "⚠️ 未解析:${MISSING}（其余继续）" >> "$GITHUB_STEP_SUMMARY" || true
+          make defconfig
+          tr ' ' '\n' < /tmp/targets | grep -v '^$' >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Compile packages（前置 tools/toolchain 预备 —— P3TERX 单包标准）
+        run: |
+          touch /tmp/ipk-begin; sleep 2
+          make tools/install -j$(nproc) || make tools/install -j1 V=s
+          make toolchain/install -j$(nproc) || make toolchain/install -j1 V=s
+          make package/kernel/linux/compile -j$(nproc) || make package/kernel/linux/compile -j1 V=s
+          TARGETS=$(cat /tmp/targets)
+          make -j$(nproc) $TARGETS || make -j1 V=s $TARGETS
+
+      - name: Collect ipk（含本轮重建的依赖）
+        run: |
+          mkdir -p ipk-out
+          find bin/packages -name "*.ipk" -newer /tmp/ipk-begin -exec cp -v {} ipk-out/ \; | head -60
+          COUNT=$(find ipk-out -name '*.ipk' | wc -l)
+          echo "### ipk 产物（$COUNT 个）" >> "$GITHUB_STEP_SUMMARY"
+          find ipk-out -name '*.ipk' -printf '%f\n' | sort >> "$GITHUB_STEP_SUMMARY" || true
+          [ "$COUNT" -gt 0 ] || { echo "没产出 ipk —— 检查包是否被选中/跳过"; exit 1; }
+
+      - name: Upload ipk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipk-${{ env.FILE_DATE }}
+          path: ipk-out/
+          retention-days: 30
