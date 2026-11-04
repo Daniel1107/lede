@@ -1,0 +1,39 @@
+# =============================================================================
+# WRT-Clean v1.0 —— 保洁员（吸收件：VIKINGYFY Auto-Clean/Cache-Clean、moruiris 定时清理、1orz workflow_run 思路）
+# 每晚清理：旧 Releases/运行记录 + 14 天以上陈旧缓存
+# 为什么要清缓存：cachewrtbuild 每次 commit 换新 key，旧缓存堆积到 10GB 配额会把活跃 key 逐出
+# =============================================================================
+name: WRT-Clean v1.0
+
+on:
+  schedule:
+    - cron: '5 21 * * *'    # 北京时间次日 05:05，避开工厂夜机(04:00)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  housekeeping:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Old Releases & workflow runs (ophub)
+        uses: ophub/delete-releases-workflows@main
+        with:
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          delete_releases: 'true'
+          releases_keep_latest: '5'
+          delete_tags: 'true'
+          delete_workflows: 'true'
+          workflows_keep_day: '30'
+
+      - name: Stale caches older than 14d
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CUTOFF=$(date -u -d '14 days ago' +%Y-%m-%dT%H:%M:%SZ)
+          gh cache list --json id,createdAt --jq ".[] | select(.createdAt < \"$CUTOFF\") | .id" \
+            | while read -r id; do gh cache delete "$id" && echo "deleted cache $id"; done || true
+          gh cache list --json id --jq 'length' | xargs -I{} echo "剩余缓存: {} 个"
